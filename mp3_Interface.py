@@ -87,14 +87,14 @@ def stop_song():
 # windows = serves as a container to hold or contain widgets
 window = Tk() #Create instance of a window: 'Tk'
 #Set size of window using 'geometry' method
-window.geometry("240x240")
+window.geometry("480x480")
 #Set title of the window using 'title' method
 window.title("Music Player") 
 
 #Convert .png to 'Photo Image' 
-icon = PhotoImage(file='music_note_icon.png')
+#icon = PhotoImage(file='music_note_icon.png')
 #Set icon image of window using 'iconphoto' function
-window.iconphoto(True, icon)
+#window.iconphoto(True, icon)
 
 #Set background color of window using 'config' method
 window.config(background="black")
