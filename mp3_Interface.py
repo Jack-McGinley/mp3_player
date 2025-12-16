@@ -1,352 +1,745 @@
 import sys
 print("Running with:", sys.executable)
-from tkinter import *
-from customtkinter import *
-from CTkListbox import *
-from PIL import Image
+
 import os
 import json
+from io import BytesIO
+from tkinter import PhotoImage, filedialog
+
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
+
 import pygame
+from PIL import Image, ImageSequence
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC
 
-#Set config file for saving music directory on startup
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "player_config.json")
+from customtkinter import *
+from CTkListbox import *
 
-#save the last folder loaded
-def save_config(music_folder):
-    data = {
-        "music_folder": music_folder
-    }
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f)
 
-#Load the folder on startup
-def load_config():
+# =========================
+# Paths / Config
+# =========================
+APP_DIR = os.path.dirname(__file__)
+CONFIG_FILE = os.path.join(APP_DIR, "player_config.json")
+ART_SIZE = (300, 300)
+
+
+def save_config(music_folder: str) -> None:
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"music_folder": music_folder}, f)
+    except OSError:
+        pass
+
+
+def load_config() -> str | None:
     if not os.path.exists(CONFIG_FILE):
         return None
-
     try:
-        with open(CONFIG_FILE, "r") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("music_folder")
-    except (json.JSONDecodeError, IOError):
+        folder = data.get("music_folder")
+        return folder if isinstance(folder, str) else None
+    except (json.JSONDecodeError, OSError):
         return None
-    
-# Helper to load saved folder (non-recursive, uses songs())
-def load_music_from_folder(folder):
-    global song_map, song_names, curr_index
 
-    song_map = songs(folder)   # reuse existing logic
-    if not song_map:
-        set_status("No MP3s found in saved folder.")
-        return
 
-    song_names = list(song_map.keys())
-    curr_index = 0 if song_names else -1
+# =========================
+# Player State
+# =========================
+song_map: dict[str, str] = {}          # title -> filepath
+song_names: list[str] = []             # titles in playlist order
+song_lengths: dict[str, float] = {}    # filepath -> seconds cache
 
-    playlist.delete(0, END)
-    for name in song_names:
-        playlist.insert(END, name)
+song_queue: list[str] = []             # queued titles
 
-    set_status(f"Loaded {len(song_names)} songs from last session.")
+curr_index: int | None = None          # playlist cursor (THIS drives next/prev)
+current_song_title: str | None = None
 
-#Set Song length for progress bar
-current_song_length = 0.0   # in seconds
-is_playing = False          # whether playback is actively progressing
+current_song_length = 0.0              # seconds
+is_playing = False                     # progress is advancing?
+play_start_offset = 0.0                # seconds into song (for skip)
 
-#Helper functions for messages
 status_restore_job = None
-current_song_title = None  # track what's playing (string)
 
-#Store songs in cache
-song_map = {}
-song_names = []
-curr_index = -1
-song_lengths = {}
+# ---- Queue visual restore state ----
+playing_from_queue = False             # True only while the *current track* came from queue
+restore_selection_index: int | None = None  # playlist selection to restore after queued track ends
 
-def set_status(msg: str):
+
+# =========================
+# UI vars (filled later)
+# =========================
+window: CTk
+playlist: CTkListbox
+progress_bar: CTkProgressBar
+status_label: CTkLabel
+next_song_label: CTkLabel
+album_art_label: CTkLabel
+middle_gif_label: CTkLabel
+queue_display: CTkListbox
+
+placeholder_gif: "GifPlayer"
+equalizer_gif: "GifPlayer"
+
+
+# =========================
+# Helpers
+# =========================
+def display_title(full_title: str) -> str:
+    s = full_title.strip()
+    if " - " in s:
+        return s.split(" - ", 1)[1].strip()
+    if "-" in s:
+        return s.split("-", 1)[1].strip()
+    return s
+
+
+def set_status(msg: str) -> None:
     status_label.configure(text=msg)
 
-def set_default_status():
-    # what should be shown normally
-    if current_song_title:
-        set_status(f"Now Playing: {current_song_title}")
-    else:
-        set_status("Ready.")
 
-def flash_status(msg: str, restore_ms: int = 3000):
-    """Show msg now; restore default status after restore_ms."""
+def set_next_line(msg: str) -> None:
+    next_song_label.configure(text=msg)
+
+
+def set_default_status() -> None:
+    if current_song_title:
+        set_status(f"▶ {display_title(current_song_title)}")
+    else:
+        set_status("Ready...")
+
+
+def flash_status(msg: str, restore_ms: int = 2500) -> None:
     global status_restore_job
     set_status(msg)
-
-    # cancel any pending restore to avoid racing
     if status_restore_job is not None:
         window.after_cancel(status_restore_job)
-
     status_restore_job = window.after(restore_ms, set_default_status)
 
-#return file_path to folder with music
-def select_dir():
-    dir_path = filedialog.askdirectory()
-    return dir_path
 
-#Create function to read songs from music folder
-def songs(folder):
-    """
-    Initializes the pygame mixer, and
-    creates a list of mp3 files contained within
-    the folder used to house the music files.
-    """
+def select_dir() -> str | None:
+    folder = filedialog.askdirectory()
+    return folder if folder else None
 
+
+def playlist_size() -> int:
     try:
-        pygame.mixer.init()
+        return playlist.size()
+    except Exception:
+        return len(song_names)
+
+
+def playlist_get(i: int) -> str:
+    try:
+        return playlist.get(i)
+    except Exception:
+        return song_names[i]
+
+
+def playlist_clear() -> None:
+    playlist.delete(0, "end")
+
+
+def playlist_insert_end(text: str) -> None:
+    playlist.insert("end", text)
+
+
+def playlist_get_selected_index() -> int | None:
+    sel = playlist.curselection()
+    if sel is None:
+        return None
+    if isinstance(sel, int):
+        return sel
+    if isinstance(sel, (tuple, list)):
+        return sel[0] if sel else None
+    return None
+
+
+def playlist_select_index(i: int) -> None:
+    # CTkListbox selection API varies by version; this covers common ones.
+    try:
+        playlist.selection_clear(0, "end")
+        playlist.selection_set(i)
+        playlist.see(i)
+        return
+    except Exception:
+        pass
+    try:
+        playlist.deselect("all")
+        playlist.select(i)
+        playlist.see(i)
+    except Exception:
+        pass
+
+
+# =========================
+# Album Art
+# =========================
+def load_album_art(mp3_path: str, size=(300, 300)) -> CTkImage | None:
+    try:
+        audio = MP3(mp3_path, ID3=ID3)
+        if not audio.tags:
+            return None
+
+        apics = [t for t in audio.tags.values() if isinstance(t, APIC)]
+        if not apics:
+            return None
+
+        front = [a for a in apics if getattr(a, "type", None) == 3]  # 3 == COVER_FRONT
+        candidates = front if front else apics
+
+        scored = []
+        for a in candidates:
+            try:
+                with Image.open(BytesIO(a.data)) as im:
+                    w, h = im.size
+            except Exception:
+                w = h = 0
+
+            squareness = (min(w, h) / max(w, h)) if max(w, h) else 0.0
+            pixels = w * h
+            byte_len = len(a.data) if a.data else 0
+            scored.append((squareness, pixels, byte_len, a))
+
+        scored.sort(reverse=True)
+        chosen = scored[0][3]
+
+        img = Image.open(BytesIO(chosen.data)).convert("RGB")
+
+        tw, th = size
+        w, h = img.size
+        side = min(w, h)
+        img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+        img = img.resize((tw, th))
+
+        return CTkImage(img, size=size)
+    except Exception:
+        return None
+
+
+# =========================
+# GIF Player (freeze-frame control lives here)
+# =========================
+def load_gif_frames_and_delays(path: str, size: tuple[int, int]) -> tuple[list[CTkImage], list[int]]:
+    frames: list[CTkImage] = []
+    delays: list[int] = []
+    im = Image.open(path)
+    for frame in ImageSequence.Iterator(im):
+        delay = max(20, int(frame.info.get("duration", 80)))
+        pil = frame.convert("RGBA").resize(size)
+        frames.append(CTkImage(pil, size=size))
+        delays.append(delay)
+    return frames, delays
+
+
+class GifPlayer:
+    def __init__(self, tk_root: CTk, target_label: CTkLabel, path: str, size: tuple[int, int]):
+        self.tk_root = tk_root
+        self.target_label = target_label
+        self.frames, self.delays = load_gif_frames_and_delays(path, size)
+
+        self.job = None
+        self._seq = []
+        self._pos = 0
+        self._loop = False
+        self._on_done = None
+
+        self.seq_startup = None         
+        self.seq_running = None        
+        self.seq_stop = None
+
+        # Default “freeze” frames if you ever want them
+        self.pause_frame_index = 0
+
+    def _sanitize_seq(self, seq):
+        if not self.frames:
+            return []
+        n = len(self.frames)
+        out = [i for i in seq if 0 <= i < n]
+        return out
+
+    def _show_frame(self, idx: int):
+        frame = self.frames[idx]
+        self.target_label.configure(image=frame)
+        self.target_label.image = frame
+
+    def play_sequence(self, seq, loop=False, on_done=None):
+        """Play a sequence of frame indices."""
+        if self.job is not None:
+            self.tk_root.after_cancel(self.job)
+            self.job = None
+
+        seq = self._sanitize_seq(seq)
+        if not seq:
+            return
+
+        self._seq = seq
+        self._pos = 0
+        self._loop = loop
+        self._on_done = on_done
+
+        def step():
+            idx = self._seq[self._pos]
+            self._show_frame(idx)
+
+            delay = self.delays[idx] if idx < len(self.delays) else 80
+
+            self._pos += 1
+            if self._pos >= len(self._seq):
+                if self._loop:
+                    self._pos = 0
+                else:
+                    self.job = None
+                    cb = self._on_done
+                    self._on_done = None
+                    if cb:
+                        cb()
+                    return
+
+            self.job = self.tk_root.after(delay, step)
+
+        step()
+
+    def start(self, mode="running"):
+        # If you never configured sequences, just animate all frames.
+        if self.seq_running is None:
+            self.play_sequence(list(range(len(self.frames))), loop=True)
+            return
+
+        if mode == "startup_then_running" and self.seq_startup:
+            self.play_sequence(self.seq_startup, loop=False,
+                                on_done=lambda: self.play_sequence(self.seq_running, loop=True))
+        else:
+            self.play_sequence(self.seq_running, loop=True)
+
+    def stop(self, mode="pause"):
+        if mode == "stop_reverse":
+            # If stop seq not configured, just freeze instead.
+            if self.seq_stop:
+                self.play_sequence(self.seq_stop, loop=False)
+            else:
+                self.stop("pause")
+            return
+
+        # pause freeze
+        if self.job is not None:
+            self.tk_root.after_cancel(self.job)
+            self.job = None
+
+        if not self.frames:
+            return
+
+        idx = max(0, min(self.pause_frame_index, len(self.frames) - 1))
+        self._show_frame(idx)
+
+
+def start_placeholder_gif() -> None:
+    placeholder_gif.start()
+
+
+def stop_placeholder_gif() -> None:
+    placeholder_gif.stop()
+
+
+# =========================
+# Audio + Playback
+# =========================
+def ensure_audio() -> bool:
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        return True
     except pygame.error as e:
-        print("Audio initialization failed! ", e)
-        return
+        flash_status(f"Audio init failed: {e}", 3000)
+        return False
 
-    if not os.path.isdir(folder):
-        print(f"Folder '{folder}' not found")
-        return
 
-    mp3_files = [file for file in os.listdir(folder) if file.endswith(".mp3")]
-    
-    if not mp3_files:
-        print("No .mp3 files found!")
-    
-    songs = {file.replace('.mp3', ""): os.path.join(folder, file) for file in mp3_files}
-    return songs
+def scan_folder(folder: str) -> dict[str, str]:
+    if not folder or not os.path.isdir(folder):
+        return {}
+    mp3_files = [f for f in os.listdir(folder) if f.lower().endswith(".mp3")]
+    return {f[:-4]: os.path.join(folder, f) for f in mp3_files}
 
-#def load_music loads the music from a directory to the listbox
-def load_music():
+
+def load_music_from_folder(folder: str) -> None:
     global song_map, song_names, curr_index
 
-    folder = select_dir()
-    print("Selected folder:", repr(folder))
-    if not folder:
-        print('Please select a folder')
-        return
-    
-    song_map = songs(folder) #dict: name -> path
+    song_map = scan_folder(folder)
     song_names = list(song_map.keys())
-    curr_index = 0 if song_names else -1
-    
-    playlist.delete(0, END)
-    for song in song_names:
-        playlist.insert(END, song)
+    curr_index = 0 if song_names else None
 
-    save_config(folder)  
+    playlist_clear()
+    for name in song_names:
+        playlist_insert_end(name)
 
-#Create a play_music function to map to play_song button
-def play_music(file_path, song_name=None):
-    """
-    Uses the filepath to open the folder 
-    containing the mp3 files and uses
-    pygame mixer to load mp3 file and play the song.
-    """
-    global current_song_length, is_playing
+    refresh_queue_mini()
+    update_next_line()
 
-    #file_path = os.path.join(folder, song_name + '.mp3')
+    if song_names:
+        flash_status(f"Loaded {len(song_names)} songs.", 2000)
+    else:
+        flash_status("No MP3s found in that folder.", 2500)
+
+
+def load_music_button() -> None:
+    folder = select_dir()
+    if not folder:
+        flash_status("No folder selected.", 2000)
+        return
+    save_config(folder)
+    load_music_from_folder(folder)
+
+
+def play_music(file_path: str) -> None:
+    global current_song_length, is_playing, play_start_offset
+
+    if not ensure_audio():
+        return
 
     if not os.path.exists(file_path):
-        flash_status("File not found", 3000)
+        flash_status("File not found.", 2500)
         return
+
+    play_start_offset = 0.0
+    progress_bar.set(0)
 
     if file_path in song_lengths:
         current_song_length = song_lengths[file_path]
     else:
         try:
-            #Get song length in seconds using Sound Object
             sound = pygame.mixer.Sound(file_path)
-            current_song_length = sound.get_length()
+            current_song_length = float(sound.get_length())
             song_lengths[file_path] = current_song_length
-        except pygame.error as e:
-            print("Could not get song length:", e)
+        except pygame.error:
             current_song_length = 0.0
 
     pygame.mixer.music.load(file_path)
     pygame.mixer.music.play()
-
-    progress_bar.set(0)
     is_playing = True
 
-#Create a function to update progress bar
-def update_progress():
-    """
-    Periodically update the progress bar based on
-    pygame.mixer.music.get_pos() and current_song_length.
-    """
-    if is_playing and current_song_length > 0:
-        pos_ms = pygame.mixer.music.get_pos()   # milliseconds since play()
-        if pos_ms >= 0:
-            pos_sec = pos_ms / 1000.0
-            fraction = min(pos_sec / current_song_length, 1.0)
-            progress_bar.set(fraction)
-        else:
-            # pos_ms < 0 can mean finished or stopped
-            progress_bar.set(0)
 
-    # schedule the next update
-    window.after(200, update_progress)  # update ~5 times per second
+# =========================
+# Queue (single source of truth)
+# =========================
+def refresh_queue_mini() -> None:
+    queue_display.delete(0, "end")
+    if not song_queue:
+        queue_display.insert("end", "(queue empty)")
+        return
 
-#Create a function to play selected song in playlist
-def play_song():
+    MAX_ITEMS = 3
+    for title in song_queue[:MAX_ITEMS]:
+        queue_display.insert("end", display_title(title))
+    if len(song_queue) > MAX_ITEMS:
+        queue_display.insert("end", f"... +{len(song_queue) - MAX_ITEMS}")
+
+
+def update_next_line() -> None:
+    if song_queue:
+        set_next_line(f"Next: {display_title(song_queue[0])}")
+        return
+
+    if playlist_size() == 0 or curr_index is None:
+        set_next_line("No songs queued.")
+        return
+
+    nxt = (curr_index + 1) % playlist_size()
+    set_next_line(f"Next: {display_title(playlist_get(nxt))}")
+
+
+def add_selected_to_queue(event=None) -> None:
+    idx = playlist_get_selected_index()
+    if idx is None or idx < 0 or idx >= len(song_names):
+        return
+    song_queue.append(song_names[idx])
+    refresh_queue_mini()
+    update_next_line()
+    flash_status("Added to queue.", 1200)
+
+
+def pop_queue_next_index() -> int | None:
+    """Pop next queued title and return its playlist index, or None."""
+    while song_queue:
+        title = song_queue.pop(0)
+        refresh_queue_mini()
+        update_next_line()
+        try:
+            return song_names.index(title)
+        except ValueError:
+            continue
+    return None
+
+
+def clear_queue(event=None) -> None:
+    song_queue.clear()
+    refresh_queue_mini()
+    update_next_line()
+    flash_status("Queue cleared.", 1500)
+
+
+# =========================
+# Playback control (QUEUE FIX + SELECTION SNAP BACK)
+# =========================
+def play_song(idx: int | None = None, update_cursor: bool = True) -> None:
     """
-    Selects the song currently selected
-    in the windows listbox and passes the song name
-    to the play_music function to load and play the track.
+    - update_cursor=True  -> normal playlist behavior (moves curr_index)
+    - update_cursor=False -> queue behavior (DOES NOT move curr_index)
     """
+    global curr_index, current_song_title, is_playing, play_start_offset
+    global playing_from_queue, restore_selection_index
 
-    global is_playing
+    if playlist_size() == 0:
+        flash_status("Playlist is empty.", 2000)
+        return
 
-    #Stop track currently playing
-    pygame.mixer.music.stop()
+    # stop current track
+    try:
+        pygame.mixer.music.stop()
+    except Exception:
+        pass
     is_playing = False
+    play_start_offset = 0.0
     progress_bar.set(0)
 
-    try:
-        #Selects currently highlighted song
-        song_title = playlist.get(playlist.curselection())
-    except TclError:
-        print("No song selected!")
-        set_status("No song selected!")
-        return
-    
-    print(f"Currently Playing: {song_title}")
+    if idx is None:
+        idx = playlist_get_selected_index()
+        if idx is None:
+            idx = 0
 
-    global current_song_title
+    # If this is a queue play, remember what selection to restore later
+    if not update_cursor:
+        playing_from_queue = True
+        restore_selection_index = curr_index  # may be None if nothing played yet
+    else:
+        playing_from_queue = False
+        restore_selection_index = None
+
+    # Always show the selected/playing item visually while it plays
+    playlist_select_index(idx)
+
+    # Only update the playlist cursor if this is a "real" playlist play
+    if update_cursor:
+        curr_index = idx
+
+    song_title = playlist_get(idx)
     current_song_title = song_title
-    set_status(f"Now Playing: {song_title}")   # immediate
 
-    #Call play_music function
-    play_music(song_map[song_title])
+    set_status(f"▶ {display_title(song_title)}")
+    update_next_line()
 
-#Create a function to pause the currently playing song
-def pause_song():
+    path = song_map.get(song_title)
+    if not path:
+        flash_status("Song path missing.", 2500)
+        return
+
+    play_music(path)
+    equalizer_gif.start()
+
+    art = load_album_art(path, size=ART_SIZE)
+    if art is None:
+        start_placeholder_gif()
+    else:
+        stop_placeholder_gif()
+        album_art_label.configure(image=art)
+        album_art_label.image = art
+
+
+def next_song(event=None) -> None:
+    """
+    Priority:
+      1) queue
+      2) playlist cursor (curr_index) + 1
+    """
+    global curr_index
+
+    if playlist_size() == 0:
+        return
+
+    q_idx = pop_queue_next_index()
+    if q_idx is not None:
+        # ✅ play queued item but DO NOT move playlist cursor
+        play_song(q_idx, update_cursor=False)
+        return
+
+    if curr_index is None:
+        play_song(0, update_cursor=True)
+        return
+
+    nxt = curr_index + 1
+    if nxt >= playlist_size():
+        nxt = 0
+
+    play_song(nxt, update_cursor=True)
+
+
+def prev_song(event=None) -> None:
+    global curr_index
+    if playlist_size() == 0:
+        return
+
+    if curr_index is None:
+        play_song(0, update_cursor=True)
+        return
+
+    prv = curr_index - 1
+    if prv < 0:
+        prv = playlist_size() - 1
+
+    play_song(prv, update_cursor=True)
+
+
+def play_selected(event=None) -> None:
+    idx = playlist_get_selected_index()
+    if idx is not None:
+        play_song(idx, update_cursor=True)
+
+
+def pause_song() -> None:
     global is_playing
-    pygame.mixer.music.pause()
-    is_playing = False    # freeze progress
-    print("Music Paused")
-    set_status("Music Paused.")
-
-#Create a function to resume the currently playing song
-def resume_song():
-    global is_playing
-    pygame.mixer.music.unpause()
-    is_playing = True     # resume progress
-    print("Music Resumed")
-    flash_status("Music Resumed.", 3000)
-
-#Create a function to stop playing the currently selected song
-def stop_song():
-    global is_playing, current_song_title
-    pygame.mixer.music.stop()
+    try:
+        pygame.mixer.music.pause()
+    except Exception:
+        return
     is_playing = False
-    progress_bar.set(0)   # reset bar
-    current_song_title=None #Set global variable to none to return 'Ready' message
-    print("Music Stopped")
-    flash_status("Music Stopped.", 3000)
+    flash_status("Music paused.", 1500)
+    equalizer_gif.stop("pause")   # freeze-frame for pause
 
-#Create a function to clear selection for CTkListbox
-def clear_selection():
-    size = playlist.size()
-    for i in range(size):
-        playlist.deselect(i)
 
-#Create a current function to get the index from CTkListbox
-def get_current_index():
-    sel = playlist.curselection()
-    return sel  # already int or None
+def resume_song() -> None:
+    global is_playing
+    try:
+        pygame.mixer.music.unpause()
+    except Exception:
+        return
+    is_playing = True
+    flash_status("Music resumed.", 1500)
+    equalizer_gif.start()
 
-#play next song in playlist
-def next_song():
-    global curr_index
-    if playlist.size() == 0:
+
+def stop_song() -> None:
+    global is_playing, current_song_title
+    global playing_from_queue, restore_selection_index
+
+    try:
+        pygame.mixer.music.stop()
+    except Exception:
+        pass
+
+    is_playing = False
+    progress_bar.set(0)
+    current_song_title = None
+    set_default_status()
+
+    playing_from_queue = False
+    restore_selection_index = None
+
+    start_placeholder_gif()
+    equalizer_gif.stop("stop_reverse")    # freeze-frame for stop
+
+
+def toggle_play_pause(event=None) -> None:
+    if is_playing:
+        pause_song()
+    else:
+        resume_song()
+
+
+def skip_seconds(delta: float) -> None:
+    global play_start_offset
+
+    if current_song_length <= 0:
         return
 
-    # Sync index from UI if needed
-    if curr_index is None:
-        idx = get_current_index()
-        curr_index = 0 if idx is None else idx
+    pos_ms = pygame.mixer.music.get_pos()
+    pos_sec = max(0.0, pos_ms / 1000.0) if pos_ms >= 0 else 0.0
+    current_abs = play_start_offset + pos_sec
 
-    next_index = curr_index + 1
+    new_pos = max(0.0, min(current_abs + delta, current_song_length - 0.1))
+    play_start_offset = new_pos
 
-    if next_index < playlist.size():
-        curr_index = next_index
-        clear_selection()
-        playlist.select(curr_index)
-        playlist.see(curr_index)
-        play_song()
-    else:
-        flash_status("Reached end of playlist.", 3000)
+    pygame.mixer.music.play(start=new_pos)
+    if not is_playing:
+        pygame.mixer.music.pause()
 
-#Play previous song in playlist
-def prev_song():
-    global curr_index
-    if playlist.size() == 0:
-        return
 
-    if curr_index is None:
-        idx = get_current_index()
-        curr_index = (playlist.size() - 1) if idx is None else idx
+current_volume = 0.5
 
-    prev_index = curr_index - 1
 
-    if prev_index >= 0:
-        curr_index = prev_index
-        clear_selection()
-        playlist.select(curr_index)
-        playlist.see(curr_index)
-        play_song()
-    else:
-        flash_status("Reached beginning of playlist.", 3000)
-
-current_volume = 0.5  # start loud
-
-def set_volume(val):
+def set_volume(val) -> None:
+    """Slider is 0..10; pygame expects 0..1."""
     global current_volume
-    # assume slider 0..100; adjust if yours is 0..1
-    current_volume = float(val)
-    pygame.mixer.music.set_volume(current_volume)
+    try:
+        current_volume = float(val) / 10.0
+        current_volume = max(0.0, min(current_volume, 1.0))
+        pygame.mixer.music.set_volume(current_volume)
+    except Exception:
+        pass
 
-#========Create Window Interface====================
 
-# windows = serves as a container to hold or contain widgets
-window = CTk() #Create instance of a window: 'Tk'
-#Set size of window using 'geometry' method
-window.geometry("600x480")
-#Set title of the window using 'title' method
-window.title("Music Player") 
+# =========================
+# Progress (QUEUE SNAP-BACK happens here)
+# =========================
+def update_progress() -> None:
+    global is_playing
+    global playing_from_queue, restore_selection_index
 
-#Convert .png to 'Photo Image' 
-icon = PhotoImage(file='icons/music_note_icon.png')
-#Set icon image of window using 'iconphoto' function
-window.iconphoto(True, icon)
+    if is_playing and current_song_length > 0:
+        pos_ms = pygame.mixer.music.get_pos()
+        if pos_ms >= 0:
+            pos_sec = play_start_offset + (pos_ms / 1000.0)
+            fraction = min(pos_sec / current_song_length, 1.0)
+            progress_bar.set(fraction)
 
-#Set background color of window using 'configure' method
+            # End detection
+            if pos_sec >= current_song_length - 0.2:
+                is_playing = False
+
+                # ✅ If the track that ended was from queue, restore selection first
+                if playing_from_queue:
+                    playing_from_queue = False
+                    if restore_selection_index is not None and 0 <= restore_selection_index < playlist_size():
+                        playlist_select_index(restore_selection_index)
+                    restore_selection_index = None
+
+                next_song()
+        else:
+            progress_bar.set(0)
+
+    window.after(200, update_progress)
+
+
+# =========================
+# UI Build (same layout architecture)
+# =========================
+window = CTk()
+window.geometry("850x720")
+window.title("Music Player")
 window.configure(fg_color="black")
 
-#label = an area widget that holds text and/or image within a window
-#Create a label using constructor: 'Label'
-label = CTkLabel(window,#pass window as argument to label that is within window
-        text="Music Player",
-        font=("Helvetica", 45, 'bold'),
-        #fg_color='black',
-        text_color='#00FFAA', #Color of text
-)
-#Add label to window using 'pack' method
-label.pack(pady=(10, 0))
+icon = PhotoImage(file=os.path.join(APP_DIR, "icons/music_note_icon.png"))
+window.iconphoto(True, icon)
 
-# Outer frame = green border, looks like a terminal window
+label = CTkLabel(
+    window,
+    text="MUSIC PLAYER",
+    font=("Monospace", 45, "bold"),
+    text_color="#00FFAA",
+)
+label.pack(pady=(10, 2))
+
 playlist_outer = CTkFrame(
     window,
     fg_color="black",
-    border_color="#00FFAA",    # bright green border
+    border_color="#00FFAA",
     border_width=3,
-    corner_radius=0            # sharp edges = more retro
+    corner_radius=0
 )
+playlist_outer.grid_columnconfigure(0, weight=1)
+playlist_outer.grid_rowconfigure(0, weight=1)
 playlist_outer.pack(padx=20, pady=(5, 10), fill="x")
 
-# Inner frame = padding + background behind label + listbox
 playlist_inner = CTkFrame(
     playlist_outer,
     fg_color="black",
@@ -354,110 +747,92 @@ playlist_inner = CTkFrame(
     border_width=4,
     corner_radius=0
 )
-playlist_inner.pack(padx=4, pady=4, fill="x")
+playlist_inner.columnconfigure(0, weight=3)
+playlist_inner.columnconfigure(1, weight=2)
+playlist_inner.rowconfigure(0, weight=1)
+playlist_inner.grid(column=0, row=0, padx=4, pady=4, sticky="nsew")
 
-# "Playlist" label, tight above the listbox
+playlist_left = CTkFrame(playlist_inner, fg_color="black", corner_radius=0)
+playlist_left.grid(row=0, column=0, sticky="nsew", padx=(4, 2), pady=4)
+
 playlist_label = CTkLabel(
-    playlist_inner,
+    playlist_left,
     text="Playlist",
     font=("Helvetica", 20, "bold"),
     text_color="#00FFAA",
     fg_color="black",
     anchor="n",
 )
-playlist_label.pack(anchor="n", pady=(6, 2))  # <- very close to listbox
+playlist_label.pack(anchor="n", pady=(6, 2))
 
-# The CTkListbox itself
 playlist = CTkListbox(
-    playlist_inner,
+    playlist_left,
     width=400,
-    height=260,
+    height=220,
     font=("Helvetica", 18),
-    fg_color="black",          # listbox background
-    text_color="#00FFAA",      # if your version supports it; if not, it's ignored
-    border_width=0,            # border handled by outer frame
+    fg_color="black",
+    text_color="#00FFAA",
+    border_width=0,
     highlight_color="#003300",
     hover_color="#004400",
 )
 playlist.pack(padx=2, pady=(2, 4), fill="x")
 
-#'Load Music' label, bottom right corner of listbox
-load_music = CTkButton(
-    playlist_inner,
-    text="Load Music",
-    command=load_music)
-load_music.configure(font=("Helvetica", 16, "bold"),
-    text_color='black',
+load_music_btn = CTkButton(playlist_left, text="Load Music", command=load_music_button)
+load_music_btn.configure(
+    font=("Helvetica", 16, "bold"),
+    text_color="black",
     fg_color="#00FFAA",
     corner_radius=0,
-    anchor="s")
-load_music.pack(anchor="s", padx=6, pady=(2, 6))
+    anchor="s",
+)
+load_music_btn.pack(anchor="s", padx=6, pady=(2, 6))
 
-#Call songs function to return list of available songs
-#mp3_files = songs()
+playlist_right = CTkFrame(
+    playlist_inner,
+    fg_color="black",
+    border_color="#00FFAA",
+    border_width=2,
+    corner_radius=0
+)
+playlist_right.grid(row=0, column=1, sticky="nsew", padx=(2, 4), pady=4)
+playlist_right.configure(width=260)
+playlist_right.grid_propagate(False)
 
-#Use insert method to add items to listbox
-#for song in mp3_files:
-#    playlist.insert(END, song)
-#Adjust size of listbox dynamically
-#playlist.configure(height=playlist.size())
+album_art_label = CTkLabel(playlist_right, text="")
+album_art_label.pack(pady=(12, 8))
 
-#Create a progress bar under the listbox
+placeholder_gif = GifPlayer(window, album_art_label, os.path.join(APP_DIR, "gifs/placeholder.gif"), ART_SIZE)
+start_placeholder_gif()
+
 progress_bar = CTkProgressBar(
     window,
-    width=450,
+    width=500,
     height=10,
     fg_color="black",
-    progress_color="#00FF00",   # retro green
+    progress_color="#00FF00",
     border_width=1,
-    border_color="#00FF00"
+    border_color="#00FF00",
 )
-progress_bar.set(0)  # start at 0%
+progress_bar.set(0)
 progress_bar.pack(pady=(2, 10))
-#Call update progress
-update_progress()
 
-#Create a frame to hold action buttons
-frame = CTkFrame(window) #Instance 'Frame' passed our window
-#Configureure visals for frame 
-frame.configure(fg_color='black')
-frame.pack(pady=10) #Add frame to window
-
-#Configureure fram to allow rows and columns
+frame = CTkFrame(window, fg_color="black")
+frame.pack(pady=10)
 frame.grid_rowconfigure(0, weight=1)
 frame.grid_rowconfigure(1, weight=1)
-#frame.grid_rowconfigure(2, weight=1)
 frame.grid_columnconfigure(0, weight=1)
 
-#Create top row of the frame
-frame_top = CTkFrame(frame, fg_color='black')
-frame_top.grid(row=0, column=0, sticky='nsew', pady=(0, 5))
+frame_top = CTkFrame(frame, fg_color="black")
+frame_top.grid(row=0, column=0, sticky="nsew", pady=(0, 5))
 
-#Create middle row of the frame
-frame_middle = CTkFrame(frame, fg_color='black')
-frame_middle.grid(row=1, column=0, sticky='nsew', pady=(0, 5))
+frame_middle = CTkFrame(frame, fg_color="black")
+frame_middle.grid(row=1, column=0, sticky="nsew", pady=(0, 5))
 
-#Create bottom row of the frame
-#frame_bottom = CTkFrame(frame, fg_color='black')
-#frame_bottom.grid(row=2, column=0, sticky='nsew', pady=(0, 5))
-
-#Each row has 3 columns for 3 buttons
-for row_frame in (frame_top, frame_middle): #frame_bottom):
+for row_frame in (frame_top, frame_middle):
     row_frame.grid_columnconfigure(0, weight=1)
     row_frame.grid_columnconfigure(1, weight=1)
-    #row_frame.grid_columnconfigure(2, weight=1)
-
-#Button Style
-button_style = {
-    "font": ("Helvetica", 18, "bold"),
-    "fg_color": "#00FFAA",    # main button color
-    "hover_color": "#004400", # hover color
-    "text_color": "black",
-    "width": 100,
-    "height": 32,
-    "border_width": 0,
-    "corner_radius": 0
-}
+    row_frame.grid_columnconfigure(2, weight=1)
 
 photo_Button_style = {
     "width": 50,
@@ -466,152 +841,126 @@ photo_Button_style = {
     "hover_color": "#003300",
     "border_color": "#00FF00",
     "border_width": 1,
+    "corner_radius": 0,
 }
 
-#Image for pause button
-pause_icon = CTkImage(
-    Image.open("icons/pause.png"),
-    size=(26, 26)
-)
+pause_icon = CTkImage(Image.open(os.path.join(APP_DIR, "icons/pause.png")), size=(26, 26))
+play_icon = CTkImage(Image.open(os.path.join(APP_DIR, "icons/play.png")), size=(26, 26))
+prev_icon = CTkImage(Image.open(os.path.join(APP_DIR, "icons/previous.png")), size=(26, 26))
+next_icon = CTkImage(Image.open(os.path.join(APP_DIR, "icons/next.png")), size=(26, 26))
+resume_icon = CTkImage(Image.open(os.path.join(APP_DIR, "icons/resume.png")), size=(26, 26))
+stop_icon = CTkImage(Image.open(os.path.join(APP_DIR, "icons/stop.png")), size=(26, 26))
 
-#Image for play button
-play_icon = CTkImage(
-    Image.open("icons/play.png"),
-    size=(26, 26)
-)
+prevButton = CTkButton(frame_top, text="", image=prev_icon, command=prev_song, **photo_Button_style)
+playButton = CTkButton(frame_top, text="", image=play_icon, command=lambda: play_song(None, update_cursor=True), **photo_Button_style)
+nextButton = CTkButton(frame_top, text="", image=next_icon, command=next_song, **photo_Button_style)
 
-#Image for previous button
-prev_icon = CTkImage(
-    Image.open("icons/previous.png"),
-    size=(26, 26)
-)
+pauseButton = CTkButton(frame_middle, text="", image=pause_icon, command=pause_song, **photo_Button_style)
+resumeButton = CTkButton(frame_middle, text="", image=resume_icon, command=resume_song, **photo_Button_style)
+stopButton = CTkButton(frame_middle, text="", image=stop_icon, command=stop_song, **photo_Button_style)
 
-#Image for next button
-next_icon = CTkImage(
-    Image.open("icons/next.png"),
-    size=(26, 26)
-)
+prevButton.grid(row=0, column=0, padx=5, pady=2)
+playButton.grid(row=0, column=1, padx=5, pady=2)
+nextButton.grid(row=0, column=2, padx=5, pady=2)
+pauseButton.grid(row=0, column=0, padx=5, pady=2)
+resumeButton.grid(row=0, column=1, padx=5, pady=2)
+stopButton.grid(row=0, column=2, padx=5, pady=2)
 
-#Image for resume button
-resume_icon = CTkImage(
-    Image.open("icons/resume.png"),
-    size=(26, 26)
-)
-
-#Image for resume button
-stop_icon = CTkImage(
-    Image.open("icons/stop.png"),
-    size=(26, 26)
-)
-
-#Button Creation
-prevButton = CTkButton(
-    frame_top,
-    text="",
-    image=prev_icon,
-    command=prev_song,
-    **photo_Button_style
-)
-
-nextButton = CTkButton(
-    frame_top,
-    text="",
-    image=next_icon,
-    command=next_song,
-    **photo_Button_style
-)
-
-playButton = CTkButton(
-    frame_top,
-    text="",
-    image=play_icon,
-    command=play_song,
-    **photo_Button_style
-)
-
-resumeButton = CTkButton(
-    frame_middle,
-    text="",
-    image=resume_icon,
-    command=resume_song,
-    **photo_Button_style
-)
-
-pauseButton = CTkButton(
-    frame_middle,
-    text="",
-    image=pause_icon,
-    command=pause_song,
-    **photo_Button_style
-)
-
-stopButton = CTkButton(
-    frame_middle,
-    text="",
-    image=stop_icon,
-    command=stop_song,
-    **photo_Button_style
-)
-
-#prevButton = CTkButton(frame_top, text="Previous", command=prev_song, **button_style)
-prevButton.grid(row=0, column=0, sticky="n", padx=5, pady=2)
-
-#playButton = CTkButton(frame_top, text="Play", command=play_song, **button_style)
-playButton.grid(row=0, column=1, sticky="n", padx=5, pady=2)
-
-#nextButton = CTkButton(frame_top, text="Next", command=next_song, **button_style)
-nextButton.grid(row=0, column=2, sticky="n", padx=5, pady=2)
-
-#pauseButton = CTkButton(frame_middle, text="Pause", command=pause_song, **button_style)
-pauseButton.grid(row=0, column=0, sticky="n", padx=5, pady=2)
-
-#resumeButton = CTkButton(frame_middle, text="Resume", command=resume_song, **button_style)
-resumeButton.grid(row=0, column=1, sticky="n", padx=5, pady=2)
-
-#stopButton = CTkButton(frame_middle, text="Stop", command=stop_song, **button_style)
-stopButton.grid(row=0, column=2, sticky="n", padx=5, pady=2)
-
-#Create a slider button for volume control
-volume = CTkSlider(window,
+volume = CTkSlider(
+    window,
     from_=0,
     to=10,
     orientation="Horizontal",
-    fg_color='black',
-    progress_color="#00FFAA",
+    fg_color="black",
+    progress_color="#00FF00",
     button_color="#003300",
     border_color="#00FF00",
     button_hover_color="#004400",
-    button_length=15,
+    button_length=2,
     width=200,
     height=10,
     border_width=1,
-    command=set_volume
+    command=set_volume,
 )
+volume.set(5)
 volume.pack(pady=5)
 
-#Create a frame at the bottom of the window
 bottom_bar = CTkFrame(window, fg_color="black")
 bottom_bar.pack(side="bottom", fill="x", padx=5, pady=5)
 bottom_bar.grid_columnconfigure(0, weight=1)
 bottom_bar.grid_columnconfigure(1, weight=1)
+bottom_bar.grid_columnconfigure(2, weight=1)
+bottom_bar.grid_rowconfigure(0, weight=1)
+bottom_bar.grid_rowconfigure(1, weight=1)
 
-quitButton = CTkButton(bottom_bar, text="QUIT", command=window.destroy, **button_style)
-quitButton.grid(row=0, column=1, sticky="e", padx=(5, 5), pady=(0, 5))  
+left_section = CTkFrame(bottom_bar, fg_color="black", width=200, height=80, border_width=1, border_color="#00FFAA", corner_radius=0)
+left_section.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(5, 0), pady=5)
+left_section.grid_propagate(False)
 
-#Terminal Line
-status_label = CTkLabel(
-    bottom_bar,
-    text="Ready.",
-    font=("Helvetica", 18),
-    text_color="#00FFAA",   # retro green
-    fg_color="black",       # same background
-    anchor="w"
+middle_section = CTkFrame(bottom_bar, fg_color="black", width=200, height=80, border_width=1, border_color="#00FFAA", corner_radius=0)
+middle_section.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(2, 2), pady=5)
+middle_section.grid_propagate(False)
+
+right_section = CTkFrame(bottom_bar, fg_color="black", width=200, height=80, border_width=1, border_color="#00FFAA", corner_radius=0)
+right_section.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(0, 5), pady=5)
+right_section.grid_propagate(False)
+
+status_label = CTkLabel(left_section, text="Ready...", font=("Consolas", 14), text_color="#00FF00", fg_color="black", anchor="w")
+status_label.grid(row=0, column=0, sticky="w", padx=(4, 2), pady=(2, 0))
+
+next_song_label = CTkLabel(left_section, text="No songs queued.", font=("Consolas", 14), text_color="#00FF00", fg_color="black", anchor="w")
+next_song_label.grid(row=1, column=0, sticky="w", padx=(4, 2), pady=(0, 2))
+
+middle_gif_label = CTkLabel(middle_section, text="")
+middle_gif_label.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=2, pady=2)
+
+equalizer_gif = GifPlayer(window, middle_gif_label, os.path.join(APP_DIR, "gifs/equalizer.gif"), (269, 75))
+#equalizer_gif.active_frame_indices = list(range(10, 25))  # only these animate when playing
+equalizer_gif.seq_startup = list(range(0, 10))          # 0..9 (once)
+equalizer_gif.seq_running = list(range(10, 26))         # 10..25 (loop)
+equalizer_gif.seq_stop = list(range(12, 9, -1))       
+equalizer_gif.pause_frame_index = 12
+equalizer_gif.stop("stop_reverse")
+
+queue_display = CTkListbox(
+    right_section,
+    width=252,
+    height=68,
+    font=("Consolas", 14),
+    fg_color="black",
+    text_color="#00FF00",
+    corner_radius=0,
 )
-status_label.grid(row=0, column=0, sticky="w", padx=(5, 5), pady=(0, 5))
+queue_display.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(1, 3), pady=(1, 3))
+refresh_queue_mini()
+
+
+# =========================
+# Bindings
+# =========================
+playlist.bind("<Double-Button-1>", play_selected)
+playlist.bind("<Button-3>", add_selected_to_queue)
+
+window.bind("<space>", toggle_play_pause)
+window.bind("<Tab>", lambda e: stop_song())
+window.bind("<Escape>", lambda e: window.destroy())
+
+window.bind("<Right>", lambda e: skip_seconds(10))
+window.bind("<Left>", lambda e: skip_seconds(-10))
+
+window.bind("<Control-Right>", next_song)
+window.bind("<Control-Left>", prev_song)
+
+window.bind("<c>", clear_queue)
+
+
+# =========================
+# Startup
+# =========================
+update_progress()
 
 last_folder = load_config()
 if last_folder and os.path.isdir(last_folder):
     load_music_from_folder(last_folder)
 
-#Display window
-window.mainloop() #Will listen for events
+window.mainloop()
